@@ -2,21 +2,26 @@
 # =============================================================================
 #  sh_package_to_githubPT.sh — SampleDir 一键发布脚本
 #
-#  流程: 打包(mac dmg+pkg) → 收集桌面产物 → 复制到 releases 仓库根目录(不建版本号文件夹)
-#        → 生成 appcast.xml(显式区分 dmg/pkg/exe/msi) → 提交 + 打 tag + 推送
-#        → 创建 GitHub Release(下载链接最稳，走 Release 直链)
+#  流程: 打包(mac dmg+pkg) → 收集桌面产物 → 进入 releases 仓库
+#        → 生成 appcast.xml(显式区分 dmg/pkg/exe/msi) → 只提交 appcast.xml
+#        → 打 tag + 推送 → 创建 GitHub Release(上传桌面产物为 asset)
+#
+#  设计原则:
+#    • 安装包(dmg/pkg/exe/msi) **不进 git / 不走 LFS**，直接作为 GitHub Release asset 上传。
+#      Git LFS 会把每个历史版本的安装包都累积到 git 历史里，导致每次 push 都上传几百 MB~几 GB。
+#    • releases 仓库只保留 appcast.xml、README 和本脚本，保持几 KB 级别。
+#    • 历史版本由 GitHub Release + tag 保留，下载直链稳定且走 CDN。
 #
 #  目标仓库: huoleihu/releases_sampleDir
-#  (专放 dmg/pkg/exe 等安装包；Cloudflare Pages 有 25MB 限制，故装包走此仓库)
+#  (只放 appcast.xml 等元数据；Cloudflare Pages 有 25MB 限制，故装包走 GitHub Release)
 #
 #  用法:
 #    ./sh_package_to_githubPT.sh                # 版本号自动读 gradle.properties(sampledir.version)，无需传参
 #    ./sh_package_to_githubPT.sh 1.0.4          # 可选：手动覆盖版本号
 #
 #  前置:
-#    ① git-lfs 已装 (brew install git-lfs) —— 160MB dmg 超 GitHub 单文件 100MB，必须走 LFS
-#    ② gh CLI 已登录 (gh auth login)        —— 用于创建 Release
-#    ③ Windows 安装包需在 PD 虚拟机打好后，拷到本机 ~/Desktop
+#    ① gh CLI 已登录 (gh auth login)        —— 用于创建 Release
+#    ② Windows 安装包需在 PD 虚拟机打好后，拷到本机 ~/Desktop
 #       (mac 端本脚本负责打包；Windows 端无法在 mac 上构建)
 #
 #  关于 tag 覆盖:
@@ -42,17 +47,13 @@ read_version_from_gradle() {
 }
 
 # ---- 前置检查 ----
-if ! command -v git-lfs >/dev/null 2>&1; then
-  echo "[error] 需要 git-lfs，请先执行: brew install git-lfs && git lfs install"
-  exit 1
-fi
 if [ "$PUBLISH_RELEASE" = "true" ] && ! command -v gh >/dev/null 2>&1; then
   echo "[error] 需要 gh CLI 来创建 Release，请先: gh auth login"
   exit 1
 fi
 
 # ---- 1) 打包 macOS (dmg + pkg 一并产出到桌面) ----
-echo "[1/6] 打包 macOS ..."
+echo "[1/5] 打包 macOS ..."
 ( cd "$MAIN_PROJECT" && ./macPackageDMG.sh )
 
 # ---- 2) 推断版本号 (默认读 gradle.properties，参数可覆盖) ----
@@ -91,30 +92,29 @@ if ! ls "$DESKTOP"/SampleDir-${VERSION}-*.dmg >/dev/null 2>&1 && \
   exit 1
 fi
 
-# ---- 4) 复制到 releases 仓库根目录(不建版本号文件夹) + Git LFS ----
+# ---- 4) 进入 releases 仓库，清理旧的安装包（不再提交到 git） ----
 cd "$RELEASES_REPO"
-git lfs install >/dev/null 2>&1 || true
 
-if ! grep -q "filter=lfs" .gitattributes 2>/dev/null; then
-cat > .gitattributes <<'EOF'
-*.dmg filter=lfs diff=lfs merge=lfs -text
-*.pkg filter=lfs diff=lfs merge=lfs -text
-*.exe filter=lfs diff=lfs merge=lfs -text
-*.msi filter=lfs diff=lfs merge=lfs -text
-EOF
-  git add .gitattributes
-fi
-
-# 平铺到仓库根：SampleDir-1.0.4-arm64.dmg / .pkg / .exe ...
-for f in "${PRODUCTS[@]}"; do
-  cp -f "$f" "$RELEASES_REPO/"
-  echo "[ok] 复制 $(basename "$f") -> 仓库根"
+# 把仓库根下旧的安装包清掉（之前版本若误提交过 LFS，这里也一并 git rm 掉）
+# 当前版本的安装包只在 GitHub Release 里，不需要留在仓库工作树
+echo "[*] 清理仓库根安装包 ..."
+for ext in dmg pkg exe msi; do
+  for old in "$RELEASES_REPO"/SampleDir-*.$ext; do
+    [ -e "$old" ] || continue
+    echo "    [del] $(basename "$old")"
+    git rm -f --ignore-unmatch --quiet "$old" 2>/dev/null || rm -f "$old"
+  done
 done
+
+# 移除旧的 LFS 规则：安装包不再走 git-lfs，避免以后误把二进制 commit 进去
+if grep -q "filter=lfs" .gitattributes 2>/dev/null; then
+  git rm -f --ignore-unmatch --quiet .gitattributes 2>/dev/null || rm -f .gitattributes
+  echo "[ok] 已移除 .gitattributes LFS 规则（安装包不再进 git）"
+fi
 
 # ---- 5) 生成 appcast.xml (显式区分 dmg / pkg / exe / msi) ----
 MAC_DMG=""; MAC_PKG=""; WIN_EXE=""; WIN_MSI=""
-for f in SampleDir-${VERSION}-*; do
-  [ -e "$f" ] || continue
+for f in "${PRODUCTS[@]}"; do
   case "$f" in
     *.dmg) MAC_DMG="$f";;
     *.pkg) MAC_PKG="$f";;
@@ -148,10 +148,10 @@ echo "    <item>"
 echo "      <title>$VERSION</title>"
 echo "      <pubDate>$PUBDATE</pubDate>"
 echo "      <sparkle:version>$VERSION</sparkle:version>"
-[ -n "$MAC_DMG" ] && gen_enc "$BASE/$MAC_DMG" "macos"   "dmg" "$MAC_DMG"
-[ -n "$MAC_PKG" ] && gen_enc "$BASE/$MAC_PKG" "macos"   "pkg" "$MAC_PKG"
-[ -n "$WIN_EXE" ] && gen_enc "$BASE/$WIN_EXE" "windows" "exe" "$WIN_EXE"
-[ -n "$WIN_MSI" ] && gen_enc "$BASE/$WIN_MSI" "windows" "msi" "$WIN_MSI"
+[ -n "$MAC_DMG" ] && gen_enc "$BASE/$(basename "$MAC_DMG")" "macos"   "dmg" "$MAC_DMG"
+[ -n "$MAC_PKG" ] && gen_enc "$BASE/$(basename "$MAC_PKG")" "macos"   "pkg" "$MAC_PKG"
+[ -n "$WIN_EXE" ] && gen_enc "$BASE/$(basename "$WIN_EXE")" "windows" "exe" "$WIN_EXE"
+[ -n "$WIN_MSI" ] && gen_enc "$BASE/$(basename "$WIN_MSI")" "windows" "msi" "$WIN_MSI"
 echo '    </item>'
 echo '  </channel>'
 echo '</rss>'
@@ -159,8 +159,9 @@ echo '</rss>'
 echo "[ok] 生成 appcast.xml (mac: ${MAC_DMG:-无}/${MAC_PKG:-无}  win: ${WIN_EXE:-无}/${WIN_MSI:-无})"
 
 # ---- 6) 提交 + 打 tag(同版本重发可覆盖) + 推送 ----
+# 注意：只提交 appcast.xml，安装包走 GitHub Release，不进 git
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-git add -A
+git add appcast.xml
 git commit -m "Release $TAG" || echo "[warn] 无新变更提交"
 
 if git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -187,7 +188,7 @@ if [ "$PUBLISH_RELEASE" = "true" ]; then
   else
     gh release create "$TAG" --title "SampleDir $TAG" --notes "SampleDir $TAG" || true
   fi
-  for f in SampleDir-${VERSION}-*; do
+  for f in "${PRODUCTS[@]}"; do
     [ -e "$f" ] && gh release upload "$TAG" "$f" --clobber || true
   done
 fi
@@ -195,4 +196,5 @@ fi
 echo ""
 echo "[done] tag=$TAG  仓库=$GH_REPO"
 echo "       appcast.xml 已生成 (installerType 区分 dmg/pkg/exe/msi)"
+echo "       安装包作为 Release asset 上传 (不走 git LFS)"
 echo "       下载链接: $BASE"
