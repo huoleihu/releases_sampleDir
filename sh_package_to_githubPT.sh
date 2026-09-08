@@ -2,8 +2,8 @@
 # =============================================================================
 #  sh_package_to_githubPT.sh — SampleDir 一键发布脚本
 #
-#  流程: 打包(mac dmg+pkg) → 收集桌面产物 → 复制到 releases 仓库
-#        → 生成 appcast.xml(区分 mac / windows) → 提交 + 打 tag + 推送
+#  流程: 打包(mac dmg+pkg) → 收集桌面产物 → 复制到 releases 仓库根目录(不建版本号文件夹)
+#        → 生成 appcast.xml(显式区分 dmg/pkg/exe/msi) → 提交 + 打 tag + 推送
 #        → 创建 GitHub Release(下载链接最稳，走 Release 直链)
 #
 #  目标仓库: huoleihu/releases_sampleDir
@@ -18,6 +18,10 @@
 #    ② gh CLI 已登录 (gh auth login)        —— 用于创建 Release
 #    ③ Windows 安装包需在 PD 虚拟机打好后，拷到本机 ~/Desktop
 #       (mac 端本脚本负责打包；Windows 端无法在 mac 上构建)
+#
+#  关于 tag 覆盖:
+#    同版本重发(重新发布)时，若 tag 已存在但指向旧 commit，脚本会 git tag -f + push -f 覆盖；
+#    若已指向当前 commit 则跳过。换版本号(如 1.0.5)不会触碰旧 tag。
 # =============================================================================
 set -e
 
@@ -56,7 +60,6 @@ if [ -z "$VERSION" ]; then
   VERSION="$(read_version_from_gradle)"
 fi
 if [ -z "$VERSION" ]; then
-  # 兜底：从桌面产物文件名推断（仅在 gradle.properties 未配置时）
   FIRST=$(ls "$DESKTOP"/SampleDir-*.dmg "$DESKTOP"/SampleDir-*.pkg "$DESKTOP"/SampleDir-*.exe 2>/dev/null | head -1)
   if [ -z "$FIRST" ]; then
     echo "[error] 无法从 gradle.properties 读取 sampledir.version，且桌面无产物，请先打包"
@@ -88,7 +91,7 @@ if ! ls "$DESKTOP"/SampleDir-${VERSION}-*.dmg >/dev/null 2>&1 && \
   exit 1
 fi
 
-# ---- 4) 复制到 releases 仓库 + Git LFS ----
+# ---- 4) 复制到 releases 仓库根目录(不建版本号文件夹) + Git LFS ----
 cd "$RELEASES_REPO"
 git lfs install >/dev/null 2>&1 || true
 
@@ -102,22 +105,21 @@ EOF
   git add .gitattributes
 fi
 
-mkdir -p "$VERSION"
+# 平铺到仓库根：SampleDir-1.0.4-arm64.dmg / .pkg / .exe ...
 for f in "${PRODUCTS[@]}"; do
-  cp -f "$f" "$VERSION/"
-  echo "[ok] 复制 $(basename "$f")"
+  cp -f "$f" "$RELEASES_REPO/"
+  echo "[ok] 复制 $(basename "$f") -> 仓库根"
 done
 
-# ---- 5) 生成 appcast.xml (区分 mac / windows) ----
+# ---- 5) 生成 appcast.xml (显式区分 dmg / pkg / exe / msi) ----
 MAC_DMG=""; MAC_PKG=""; WIN_EXE=""; WIN_MSI=""
-for f in "$VERSION"/SampleDir-*; do
+for f in SampleDir-${VERSION}-*; do
   [ -e "$f" ] || continue
-  b="$(basename "$f")"
-  case "$b" in
-    *.dmg) MAC_DMG="$b";;
-    *.pkg) MAC_PKG="$b";;
-    *.exe) WIN_EXE="$b";;
-    *.msi) WIN_MSI="$b";;
+  case "$f" in
+    *.dmg) MAC_DMG="$f";;
+    *.pkg) MAC_PKG="$f";;
+    *.exe) WIN_EXE="$f";;
+    *.msi) WIN_MSI="$f";;
   esac
 done
 
@@ -125,15 +127,16 @@ PUBDATE="$(date -u +"%a, %d %b %Y %H:%M:%S +0000")"
 if [ "$PUBLISH_RELEASE" = "true" ]; then
   BASE="https://github.com/$GH_REPO/releases/download/$TAG"
 else
-  BASE="https://raw.githubusercontent.com/$GH_REPO/$TAG/$VERSION"
+  BASE="https://raw.githubusercontent.com/$GH_REPO/$TAG"
 fi
 
 sha256_of() { [ -f "$1" ] && shasum -a 256 "$1" | awk '{print $1}' || echo ""; }
 gen_enc() {
-  local url="$1" os="$2" file="$3" len sha
-  len=$(stat -f%z "$VERSION/$file" 2>/dev/null || echo 0)
-  sha=$(sha256_of "$VERSION/$file")
-  echo "    <enclosure url=\"$url\" sparkle:os=\"$os\" length=\"$len\" type=\"application/octet-stream\" sparkle:version=\"$VERSION\" sha256=\"$sha\" />"
+  local url="$1" os="$2" itype="$3" file="$4" len sha
+  len=$(stat -f%z "$file" 2>/dev/null || echo 0)
+  sha=$(sha256_of "$file")
+  # installerType 显式标注 dmg/pkg/exe/msi，不靠 URL 后缀判断
+  echo "    <enclosure url=\"$url\" sparkle:os=\"$os\" installerType=\"$itype\" length=\"$len\" type=\"application/octet-stream\" sparkle:version=\"$VERSION\" sha256=\"$sha\" />"
 }
 
 {
@@ -145,40 +148,51 @@ echo "    <item>"
 echo "      <title>$VERSION</title>"
 echo "      <pubDate>$PUBDATE</pubDate>"
 echo "      <sparkle:version>$VERSION</sparkle:version>"
-[ -n "$MAC_DMG" ] && gen_enc "$BASE/$MAC_DMG" "macos"   "$MAC_DMG"
-[ -n "$MAC_PKG" ] && gen_enc "$BASE/$MAC_PKG" "macos"   "$MAC_PKG"
-[ -n "$WIN_EXE" ] && gen_enc "$BASE/$WIN_EXE" "windows" "$WIN_EXE"
-[ -n "$WIN_MSI" ] && gen_enc "$BASE/$WIN_MSI" "windows" "$WIN_MSI"
+[ -n "$MAC_DMG" ] && gen_enc "$BASE/$MAC_DMG" "macos"   "dmg" "$MAC_DMG"
+[ -n "$MAC_PKG" ] && gen_enc "$BASE/$MAC_PKG" "macos"   "pkg" "$MAC_PKG"
+[ -n "$WIN_EXE" ] && gen_enc "$BASE/$WIN_EXE" "windows" "exe" "$WIN_EXE"
+[ -n "$WIN_MSI" ] && gen_enc "$BASE/$WIN_MSI" "windows" "msi" "$WIN_MSI"
 echo '    </item>'
 echo '  </channel>'
 echo '</rss>'
 } > appcast.xml
 echo "[ok] 生成 appcast.xml (mac: ${MAC_DMG:-无}/${MAC_PKG:-无}  win: ${WIN_EXE:-无}/${WIN_MSI:-无})"
 
-# ---- 6) 提交 + 打 tag + 推送 ----
+# ---- 6) 提交 + 打 tag(同版本重发可覆盖) + 推送 ----
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 git add -A
 git commit -m "Release $TAG" || echo "[warn] 无新变更提交"
-if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+
+if git rev-parse "$TAG" >/dev/null 2>&1; then
+  EXISTING="$(git rev-parse "$TAG")"
+  CURRENT="$(git rev-parse HEAD)"
+  if [ "$EXISTING" != "$CURRENT" ]; then
+    echo "[warn] tag $TAG 已存在且指向旧 commit，强制覆盖 (re-release)"
+    git tag -f "$TAG"
+    git push -f origin "$TAG"
+  else
+    echo "[ok] tag $TAG 已指向当前 commit，跳过"
+  fi
+else
   git tag "$TAG"
   echo "[ok] 打 tag $TAG"
+  git push origin "$TAG"
 fi
 git push origin "$BRANCH"
-git push origin "$TAG" || true
 
 # ---- 7) 创建 GitHub Release (下载链接最稳，无 LFS 带宽配额) ----
 if [ "$PUBLISH_RELEASE" = "true" ]; then
   if gh release view "$TAG" >/dev/null 2>&1; then
-    echo "[ok] Release $TAG 已存在"
+    echo "[ok] Release $TAG 已存在，更新 asset"
   else
     gh release create "$TAG" --title "SampleDir $TAG" --notes "SampleDir $TAG" || true
   fi
-  for f in "$VERSION"/SampleDir-*; do
+  for f in SampleDir-${VERSION}-*; do
     [ -e "$f" ] && gh release upload "$TAG" "$f" --clobber || true
   done
 fi
 
 echo ""
 echo "[done] tag=$TAG  仓库=$GH_REPO"
-echo "       appcast.xml 已生成 (客户端可改读此 XML 做版本检测与更新)"
+echo "       appcast.xml 已生成 (installerType 区分 dmg/pkg/exe/msi)"
 echo "       下载链接: $BASE"
