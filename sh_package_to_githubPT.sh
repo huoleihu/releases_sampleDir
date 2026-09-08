@@ -189,7 +189,10 @@ if [ "$PUBLISH_RELEASE" = "true" ]; then
     gh release create "$TAG" --title "SampleDir $TAG" --notes "SampleDir $TAG" || true
   fi
   for f in "${PRODUCTS[@]}"; do
-    [ -e "$f" ] && gh release upload "$TAG" "$f" --clobber || true
+    if [ -e "$f" ]; then
+      echo "[*] 上传 Release asset: $(basename "$f") ..."
+      gh release upload "$TAG" "$f" --clobber
+    fi
   done
 fi
 
